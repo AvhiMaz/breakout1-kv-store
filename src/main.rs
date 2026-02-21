@@ -1,7 +1,7 @@
 use breakout1_kv_store::Engine;
 
 fn main() -> std::io::Result<()> {
-    let mut db = Engine::load("data.db")?;
+    let db = Engine::load("data.db")?;      // No need to make it mutable any longer
 
     db.set(b"hello".to_vec(), b"world".to_vec())?;
     db.del(b"hello".to_vec())?;
