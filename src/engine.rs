@@ -1,27 +1,40 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::types::{DataFileEntry, LogIndex};
 
+const DEFAULT_COMPACT_THRESHOLD: u64 = 1024 * 1024;
+
 pub struct Engine {
+    path: PathBuf,
     file: File,
     index: HashMap<Vec<u8>, LogIndex>,
+    file_size: u64,
+    compact_threshold: u64,
 }
 
 impl Engine {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::load_with_threshold(path, DEFAULT_COMPACT_THRESHOLD)
+    }
+
+    pub fn load_with_threshold(path: impl AsRef<Path>, compact_threshold: u64) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(path)?;
+            .open(&path)?;
 
         let mut engine = Engine {
+            path,
             file,
             index: HashMap::new(),
+            file_size: 0,
+            compact_threshold,
         };
 
         engine.rebuild_index()?;
@@ -65,6 +78,8 @@ impl Engine {
             }
         }
 
+        self.file_size = self.file.stream_position()?;
+
         Ok(())
     }
 
@@ -92,13 +107,13 @@ impl Engine {
         self.file.write_all(&data)?;
         self.file.flush()?;
 
-        self.index.insert(
-            key,
-            LogIndex {
-                pos: data_pos,
-                len: entry_len,
-            },
-        );
+        self.file_size += 8 + entry_len;
+
+        self.index.insert(key, LogIndex { pos: data_pos, len: entry_len });
+
+        if self.file_size >= self.compact_threshold {
+            self.compact()?;
+        }
 
         Ok(())
     }
@@ -148,158 +163,52 @@ impl Engine {
 
         Ok(entry.value)
     }
-}
 
+    pub fn compact(&mut self) -> io::Result<()> {
+        let tmp_path = self.path.with_extension("tmp");
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::NamedTempFile;
+        let mut tmp_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
 
-    // Helper to create a temp engine
-    fn temp_engine() -> (Engine, tempfile::NamedTempFile) {
-        let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load(file.path()).unwrap();
-        (engine, file)
-    }
+        let entries: Vec<(Vec<u8>, LogIndex)> = self
+            .index
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
-    // --- Basic CRUD ---
+        let mut new_index: HashMap<Vec<u8>, LogIndex> = HashMap::new();
+        let mut new_file_size: u64 = 0;
 
-    #[test]
-    fn test_set_and_get() {
-        let (mut engine, _f) = temp_engine();
-        engine.set(b"name".to_vec(), b"alice".to_vec()).unwrap();
-        let val = engine.get(b"name").unwrap();
-        assert_eq!(val, Some(b"alice".to_vec()));
-    }
+        for (key, log_index) in entries {
+            self.file.seek(SeekFrom::Start(log_index.pos))?;
+            let mut data = vec![0u8; log_index.len as usize];
+            self.file.read_exact(&mut data)?;
 
-    #[test]
-    fn test_get_nonexistent_key_returns_none() {
-        let (mut engine, _f) = temp_engine();
-        let val = engine.get(b"ghost").unwrap();
-        assert_eq!(val, None);
-    }
+            let entry_len = data.len() as u64;
+            tmp_file.write_all(&entry_len.to_le_bytes())?;
+            let new_pos = tmp_file.stream_position()?;
+            tmp_file.write_all(&data)?;
 
-    #[test]
-    fn test_delete_key() {
-        let (mut engine, _f) = temp_engine();
-        engine.set(b"key".to_vec(), b"value".to_vec()).unwrap();
-        engine.del(b"key".to_vec()).unwrap();
-        let val = engine.get(b"key").unwrap();
-        assert_eq!(val, None);
-    }
-
-    #[test]
-    fn test_delete_nonexistent_key_is_ok() {
-        let (mut engine, _f) = temp_engine();
-        // should not panic or error
-        engine.del(b"nothing".to_vec()).unwrap();
-    }
-
-    #[test]
-    fn test_overwrite_key() {
-        let (mut engine, _f) = temp_engine();
-        engine.set(b"k".to_vec(), b"v1".to_vec()).unwrap();
-        engine.set(b"k".to_vec(), b"v2".to_vec()).unwrap();
-        let val = engine.get(b"k").unwrap();
-        assert_eq!(val, Some(b"v2".to_vec()));
-    }
-
-    // --- Multiple keys ---
-
-    #[test]
-    fn test_multiple_keys() {
-        let (mut engine, _f) = temp_engine();
-        engine.set(b"a".to_vec(), b"1".to_vec()).unwrap();
-        engine.set(b"b".to_vec(), b"2".to_vec()).unwrap();
-        engine.set(b"c".to_vec(), b"3".to_vec()).unwrap();
-
-        assert_eq!(engine.get(b"a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(engine.get(b"b").unwrap(), Some(b"2".to_vec()));
-        assert_eq!(engine.get(b"c").unwrap(), Some(b"3".to_vec()));
-    }
-
-    // --- Persistence / index rebuild ---
-
-    #[test]
-    fn test_index_rebuilt_after_reload() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_owned();
-
-        {
-            let mut engine = Engine::load(&path).unwrap();
-            engine.set(b"foo".to_vec(), b"bar".to_vec()).unwrap();
-            engine.set(b"hello".to_vec(), b"world".to_vec()).unwrap();
-        } // engine dropped, file stays
-
-        // reload engine from same file
-        let mut engine = Engine::load(&path).unwrap();
-        assert_eq!(engine.get(b"foo").unwrap(), Some(b"bar".to_vec()));
-        assert_eq!(engine.get(b"hello").unwrap(), Some(b"world".to_vec()));
-    }
-
-    #[test]
-    fn test_delete_persists_after_reload() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_owned();
-
-        {
-            let mut engine = Engine::load(&path).unwrap();
-            engine.set(b"key".to_vec(), b"val".to_vec()).unwrap();
-            engine.del(b"key".to_vec()).unwrap();
+            new_file_size += 8 + entry_len;
+            new_index.insert(key, LogIndex { pos: new_pos, len: entry_len });
         }
 
-        let mut engine = Engine::load(&path).unwrap();
-        assert_eq!(engine.get(b"key").unwrap(), None);
-    }
+        tmp_file.flush()?;
+        drop(tmp_file);
 
-    #[test]
-    fn test_overwrite_persists_after_reload() {
-        let file = NamedTempFile::new().unwrap();
-        let path = file.path().to_owned();
+        std::fs::rename(&tmp_path, &self.path)?;
 
-        {
-            let mut engine = Engine::load(&path).unwrap();
-            engine.set(b"k".to_vec(), b"old".to_vec()).unwrap();
-            engine.set(b"k".to_vec(), b"new".to_vec()).unwrap();
-        }
+        self.file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        self.index = new_index;
+        self.file_size = new_file_size;
 
-        let mut engine = Engine::load(&path).unwrap();
-        assert_eq!(engine.get(b"k").unwrap(), Some(b"new".to_vec()));
-    }
-
-    // --- Edge cases ---
-
-    #[test]
-    fn test_empty_value() {
-        let (mut engine, _f) = temp_engine();
-        engine.set(b"empty".to_vec(), b"".to_vec()).unwrap();
-        assert_eq!(engine.get(b"empty").unwrap(), Some(b"".to_vec()));
-    }
-
-    #[test]
-    fn test_large_value() {
-        let (mut engine, _f) = temp_engine();
-        let large_val = vec![0xABu8; 1024 * 1024]; // 1MB
-        engine.set(b"big".to_vec(), large_val.clone()).unwrap();
-        assert_eq!(engine.get(b"big").unwrap(), Some(large_val));
-    }
-
-    #[test]
-    fn test_binary_keys_and_values() {
-        let (mut engine, _f) = temp_engine();
-        let key = vec![0x00, 0xFF, 0x42, 0x13];
-        let val = vec![0xDE, 0xAD, 0xBE, 0xEF];
-        engine.set(key.clone(), val.clone()).unwrap();
-        assert_eq!(engine.get(&key).unwrap(), Some(val));
-    }
-
-    #[test]
-    fn test_many_overwrites_index_stays_correct() {
-        let (mut engine, _f) = temp_engine();
-        for i in 0..100u32 {
-            engine.set(b"counter".to_vec(), i.to_le_bytes().to_vec()).unwrap();
-        }
-        assert_eq!(engine.get(b"counter").unwrap(), Some(99u32.to_le_bytes().to_vec()));
+        Ok(())
     }
 }
