@@ -87,6 +87,20 @@ fn bench_delete(c: &mut Criterion) {
     });
 }
 
+fn bench_set_delete(c: &mut Criterion) {
+    c.bench_function("set_delete_key", |b| {
+        let file = NamedTempFile::new().unwrap();
+        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let mut i = 0u64;
+        b.iter(|| {
+            let key = format!("key{}", i);
+            engine.set(key.as_bytes(), b"value").unwrap();
+            engine.del(black_box(key.as_bytes())).unwrap();
+            i += 1;
+        });
+    });
+}
+
 fn bench_set_then_get(c: &mut Criterion) {
     c.bench_function("set_then_get", |b| {
         let file = NamedTempFile::new().unwrap();
@@ -251,6 +265,7 @@ criterion_group!(
     bench_get_missing,
     bench_overwrite,
     bench_delete,
+    bench_set_delete,
     bench_set_then_get,
     bench_compact,
     bench_load_rebuild_index,
