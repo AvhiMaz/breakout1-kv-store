@@ -1,5 +1,5 @@
 use breakout1_kv_store::Engine;
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use std::sync::Arc;
 use std::thread;
 use tempfile::NamedTempFile;
@@ -9,7 +9,7 @@ fn bench_set(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let file = NamedTempFile::new().unwrap();
-                let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+                let engine = Engine::load(file.path()).unwrap();
                 let key = b"bench_set_key".to_vec();
                 (engine, file, key)
             },
@@ -24,7 +24,7 @@ fn bench_set(c: &mut Criterion) {
 fn bench_get_existing(c: &mut Criterion) {
     c.bench_function("get_existing_key", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
         for i in 0..1000u32 {
             engine
                 .set(
@@ -45,7 +45,7 @@ fn bench_get_existing(c: &mut Criterion) {
 fn bench_get_missing(c: &mut Criterion) {
     c.bench_function("get_missing_key", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
         engine.set(b"exists", b"yes").unwrap();
         b.iter(|| {
             black_box(engine.get(black_box(b"nonexistent")).unwrap());
@@ -56,7 +56,7 @@ fn bench_get_missing(c: &mut Criterion) {
 fn bench_overwrite(c: &mut Criterion) {
     c.bench_function("overwrite_same_key", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             engine
@@ -70,7 +70,7 @@ fn bench_overwrite(c: &mut Criterion) {
 fn bench_delete(c: &mut Criterion) {
     c.bench_function("delete_key", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
 
         for idx in 0..100_000u64 {
             let key = format!("key{}", idx);
@@ -90,7 +90,7 @@ fn bench_delete(c: &mut Criterion) {
 fn bench_set_delete(c: &mut Criterion) {
     c.bench_function("set_delete_key", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("key{}", i);
@@ -104,7 +104,7 @@ fn bench_set_delete(c: &mut Criterion) {
 fn bench_set_then_get(c: &mut Criterion) {
     c.bench_function("set_then_get", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
         let mut i = 0u64;
         b.iter(|| {
             let key = format!("key{}", i);
@@ -120,7 +120,7 @@ fn bench_compact(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let file = NamedTempFile::new().unwrap();
-                let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+                let engine = Engine::load(file.path()).unwrap();
                 for i in 0..500u32 {
                     engine.set(b"k", &i.to_le_bytes()).unwrap();
                 }
@@ -158,7 +158,7 @@ fn bench_load_rebuild_index(c: &mut Criterion) {
 fn bench_large_value(c: &mut Criterion) {
     c.bench_function("set_get_4kb_value", |b| {
         let file = NamedTempFile::new().unwrap();
-        let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+        let engine = Engine::load(file.path()).unwrap();
         let large_val = vec![0xABu8; 4096];
         let mut i = 0u64;
         b.iter(|| {
@@ -175,7 +175,7 @@ fn bench_concurrent_reads(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let file = NamedTempFile::new().unwrap();
-                let engine = Arc::new(Engine::load_with_threshold(file.path(), u64::MAX).unwrap());
+                let engine = Arc::new(Engine::load(file.path()).unwrap());
                 for i in 0..1000u32 {
                     engine
                         .set(
@@ -210,7 +210,7 @@ fn bench_concurrent_writes(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let file = NamedTempFile::new().unwrap();
-                let engine = Arc::new(Engine::load_with_threshold(file.path(), u64::MAX).unwrap());
+                let engine = Arc::new(Engine::load(file.path()).unwrap());
                 (engine, file)
             },
             |(engine, _file)| {
@@ -238,7 +238,7 @@ fn bench_mixed_workload(c: &mut Criterion) {
         b.iter_batched(
             || {
                 let file = NamedTempFile::new().unwrap();
-                let engine = Engine::load_with_threshold(file.path(), u64::MAX).unwrap();
+                let engine = Engine::load(file.path()).unwrap();
                 (engine, file)
             },
             |(engine, _file)| {

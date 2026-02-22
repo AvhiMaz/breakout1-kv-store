@@ -1,6 +1,9 @@
 use breakout1_kv_store::Engine;
-use breakout1_kv_store::constants::DEFAULT_COMPACT_THRESHOLD;
+use breakout1_kv_store::constants::{
+    DEFAULT_COMPACT_THRESHOLD, FILE_HEADER_MAGIC, FILE_HEADER_SIZE,
+};
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::thread;
 use tempfile::NamedTempFile;
@@ -9,6 +12,32 @@ fn temp_engine() -> (Engine, NamedTempFile) {
     let file = NamedTempFile::new().unwrap();
     let engine = Engine::load(file.path()).unwrap();
     (engine, file)
+}
+
+fn read_threshold_from_file(path: &std::path::Path) -> u64 {
+    let mut file = fs::OpenOptions::new().read(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).unwrap();
+    assert_eq!(magic, FILE_HEADER_MAGIC);
+
+    let mut threshold_buf = [0u8; 8];
+    file.read_exact(&mut threshold_buf).unwrap();
+    u64::from_le_bytes(threshold_buf)
+}
+
+fn write_header(path: &std::path::Path, threshold: u64) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .unwrap();
+    use std::io::Write;
+    file.write_all(&FILE_HEADER_MAGIC).unwrap();
+    file.write_all(&threshold.to_le_bytes()).unwrap();
+    file.flush().unwrap();
 }
 
 #[test]
@@ -192,7 +221,8 @@ fn test_auto_compact_triggered_by_threshold() {
     let file = NamedTempFile::new().unwrap();
     let path = file.path().to_owned();
     let threshold = 512;
-    let engine = Engine::load_with_threshold(&path, threshold).unwrap();
+    write_header(&path, threshold);
+    let engine = Engine::load(&path).unwrap();
 
     for i in 0..200u32 {
         engine.set(b"key", &i.to_le_bytes()).unwrap();
@@ -204,6 +234,32 @@ fn test_auto_compact_triggered_by_threshold() {
         engine.get(b"key").unwrap(),
         Some(199u32.to_le_bytes().to_vec())
     );
+}
+
+#[test]
+fn test_threshold_persisted_in_file_header() {
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let threshold = DEFAULT_COMPACT_THRESHOLD;
+
+    let engine = Engine::load(&path).unwrap();
+    engine.set(b"k", b"v").unwrap();
+
+    assert!(fs::metadata(&path).unwrap().len() >= FILE_HEADER_SIZE);
+    assert_eq!(read_threshold_from_file(&path), threshold);
+}
+
+#[test]
+fn test_threshold_doubles_when_compaction_size_unchanged() {
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_owned();
+    let threshold = 64;
+
+    write_header(&path, threshold);
+    let engine = Engine::load(&path).unwrap();
+    engine.set(b"only-key", &vec![b'x'; 256]).unwrap();
+
+    assert_eq!(read_threshold_from_file(&path), threshold * 2);
 }
 
 // ==================== New Multithreading Tests ====================

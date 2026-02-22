@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::constants::{DEFAULT_COMPACT_THRESHOLD, LEN_PREFIX_SIZE};
+use crate::constants::{
+    DEFAULT_COMPACT_THRESHOLD, FILE_HEADER_MAGIC, FILE_HEADER_SIZE, LEN_PREFIX_SIZE,
+};
 use crate::types::{DataFileEntry, LogIndex};
 
 pub struct Engine {
@@ -13,20 +15,17 @@ pub struct Engine {
     file: Mutex<File>,
     index: RwLock<HashMap<Vec<u8>, LogIndex>>,
     file_size: Mutex<u64>,
-    compact_threshold: u64,
+    compact_threshold: Mutex<u64>,
     reader_pool: Mutex<Vec<File>>,
 }
 
 impl Engine {
     pub fn load(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::load_with_threshold(path, DEFAULT_COMPACT_THRESHOLD)
-    }
-
-    pub fn load_with_threshold(path: impl AsRef<Path>, compact_threshold: u64) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let compact_threshold = Self::ensure_header(&path, DEFAULT_COMPACT_THRESHOLD)?;
         let file = OpenOptions::new()
             .read(true)
-            .append(true)
+            .write(true)
             .create(true)
             .truncate(false)
             .open(&path)?;
@@ -43,7 +42,7 @@ impl Engine {
             file: Mutex::new(file),
             index: RwLock::new(HashMap::new()),
             file_size: Mutex::new(0),
-            compact_threshold,
+            compact_threshold: Mutex::new(compact_threshold),
             reader_pool: Mutex::new(readers),
         };
 
@@ -52,9 +51,59 @@ impl Engine {
         Ok(engine)
     }
 
+    fn ensure_header(path: &Path, compact_threshold: u64) -> io::Result<u64> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+
+        let file_len = file.metadata()?.len();
+        if file_len == 0 {
+            Self::write_header(&mut file, compact_threshold)?;
+            return Ok(compact_threshold);
+        }
+
+        if file_len < FILE_HEADER_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid data.db: missing header",
+            ));
+        }
+
+        file.seek(SeekFrom::Start(0))?;
+        let mut magic = [0u8; FILE_HEADER_MAGIC.len()];
+        file.read_exact(&mut magic)?;
+        if magic != FILE_HEADER_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid data.db: unsupported format (missing KVS1 header)",
+            ));
+        }
+
+        let mut threshold_buf = [0u8; 8];
+        file.read_exact(&mut threshold_buf)?;
+        Ok(u64::from_le_bytes(threshold_buf))
+    }
+
+    fn write_header(file: &mut File, compact_threshold: u64) -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&FILE_HEADER_MAGIC)?;
+        file.write_all(&compact_threshold.to_le_bytes())?;
+        file.flush()?;
+        Ok(())
+    }
+
+    fn persist_threshold(&self, compact_threshold: u64) -> io::Result<()> {
+        let mut file = OpenOptions::new().read(true).write(true).open(&self.path)?;
+        Self::write_header(&mut file, compact_threshold)
+    }
+
     fn rebuild_index(&self) -> io::Result<()> {
         let mut file = self.file.lock().unwrap();
-        file.seek(SeekFrom::Start(0))?;
+        file.seek(SeekFrom::Start(FILE_HEADER_SIZE))?;
+        let mut rebuilt_index: HashMap<Vec<u8>, LogIndex> = HashMap::new();
 
         loop {
             let mut len_buf = [0u8; LEN_PREFIX_SIZE as usize];
@@ -77,10 +126,9 @@ impl Engine {
             let entry: DataFileEntry = wincode::deserialize(&data)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-            let mut index = self.index.write().unwrap();
             match entry.value {
                 Some(_) => {
-                    index.insert(
+                    rebuilt_index.insert(
                         entry.key,
                         LogIndex {
                             pos: data_pos,
@@ -89,11 +137,12 @@ impl Engine {
                     );
                 }
                 None => {
-                    index.remove(&entry.key);
+                    rebuilt_index.remove(&entry.key);
                 }
             }
         }
 
+        *self.index.write().unwrap() = rebuilt_index;
         *self.file_size.lock().unwrap() = file.stream_position()?;
 
         Ok(())
@@ -116,13 +165,14 @@ impl Engine {
         let entry_len = data.len() as u64;
 
         let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::End(0))?;
         file.write_all(&entry_len.to_le_bytes())?;
 
         let data_pos = file.stream_position()?;
         file.write_all(&data)?;
-        file.flush()?;
 
-        *self.file_size.lock().unwrap() += LEN_PREFIX_SIZE + entry_len;
+        let new_file_size = *self.file_size.lock().unwrap() + LEN_PREFIX_SIZE + entry_len;
+        *self.file_size.lock().unwrap() = new_file_size;
 
         self.index.write().unwrap().insert(
             key.to_vec(),
@@ -132,7 +182,8 @@ impl Engine {
             },
         );
 
-        let should_compact = *self.file_size.lock().unwrap() >= self.compact_threshold;
+        let current_threshold = *self.compact_threshold.lock().unwrap();
+        let should_compact = new_file_size >= current_threshold;
         drop(file);
 
         if should_compact {
@@ -159,10 +210,10 @@ impl Engine {
         let entry_len = data.len() as u64;
 
         let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::End(0))?;
         file.write_all(&entry_len.to_le_bytes())?;
 
         file.write_all(&data)?;
-        file.flush()?;
 
         *self.file_size.lock().unwrap() += LEN_PREFIX_SIZE + entry_len;
         self.index.write().unwrap().remove(key);
@@ -208,6 +259,8 @@ impl Engine {
 
     pub fn compact(&self) -> io::Result<()> {
         let mut file = self.file.lock().unwrap();
+        let old_file_size = *self.file_size.lock().unwrap();
+        let compact_threshold = *self.compact_threshold.lock().unwrap();
 
         let tmp_path = self.path.with_extension("tmp");
 
@@ -217,6 +270,8 @@ impl Engine {
             .create(true)
             .truncate(true)
             .open(&tmp_path)?;
+        Self::write_header(&mut tmp_file, compact_threshold)?;
+        tmp_file.seek(SeekFrom::Start(FILE_HEADER_SIZE))?;
 
         let entries: Vec<(Vec<u8>, LogIndex)> = self
             .index
@@ -227,7 +282,7 @@ impl Engine {
             .collect();
 
         let mut new_index: HashMap<Vec<u8>, LogIndex> = HashMap::new();
-        let mut new_file_size: u64 = 0;
+        let mut new_file_size: u64 = FILE_HEADER_SIZE;
 
         for (key, log_index) in entries {
             file.seek(SeekFrom::Start(log_index.pos))?;
@@ -257,10 +312,7 @@ impl Engine {
         let mut index = self.index.write().unwrap();
 
         std::fs::rename(&tmp_path, &self.path)?;
-        *file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&self.path)?;
+        *file = OpenOptions::new().read(true).write(true).open(&self.path)?;
         *index = new_index;
         *self.file_size.lock().unwrap() = new_file_size;
 
@@ -269,6 +321,14 @@ impl Engine {
             if let Ok(r) = OpenOptions::new().read(true).open(&self.path) {
                 pool.push(r);
             }
+        }
+
+        if new_file_size == old_file_size {
+            let mut threshold = self.compact_threshold.lock().unwrap();
+            *threshold = threshold.saturating_mul(2);
+            let updated_threshold = *threshold;
+            drop(threshold);
+            self.persist_threshold(updated_threshold)?;
         }
 
         Ok(())
