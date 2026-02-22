@@ -10,4 +10,9 @@ tokio = {version = "1.49.0",features = ["macros","rt-multi-thread"]}
 wincode = { version = "0.4.4", features = ["derive"] }
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+
+[[bench]]
+name = "engine_bench"
+harness = false
