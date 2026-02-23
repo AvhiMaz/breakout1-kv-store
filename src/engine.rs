@@ -323,7 +323,7 @@ impl Engine {
             }
         }
 
-        if new_file_size == old_file_size {
+        if new_file_size * 4 > old_file_size * 3 {
             let mut threshold = self.compact_threshold.lock().unwrap();
             *threshold = threshold.saturating_mul(2);
             let updated_threshold = *threshold;
