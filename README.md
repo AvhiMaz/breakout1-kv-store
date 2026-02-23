@@ -25,6 +25,7 @@ Engine
  |-- index: in-memory HashMap key -> LogIndex { pos, len } (RwLock)
  |-- reader_pool: pooled read-only file handles (Mutex<Vec<File>>)
  |-- file_size: tracked incrementally, triggers auto-compaction
+ |-- compact_threshold: mutable threshold (Mutex<u64>), persisted in file header
 ```
 
 ### On-disk format
@@ -53,7 +54,7 @@ Then each record is written as:
 | `del(key)` | Append a tombstone and remove the key from the index |
 | `compact()` | Rewrite the log keeping only live entries, shrink the file |
 
-Auto-compaction fires inside `set` whenever the log file exceeds the threshold (default 1 MB). After compaction, if the file size did not shrink, the threshold is doubled and persisted back to the file header.
+Auto-compaction fires inside `set` whenever the log file exceeds the threshold (default 1 MB). After compaction, if the file size shrank by less than 25%, the threshold is doubled and persisted back to the file header. The threshold can be changed via `DEFAULT_COMPACT_THRESHOLD` in `constants.rs`.
 
 ## Concurrency
 
@@ -101,7 +102,7 @@ src/
   main.rs         - actix-web HTTP server
   engine.rs       - Engine struct, all storage logic
   types.rs        - DataFileEntry, LogIndex
-  constants.rs    - DEFAULT_COMPACT_THRESHOLD, LEN_PREFIX_SIZE
+  constants.rs    - DEFAULT_COMPACT_THRESHOLD, LEN_PREFIX_SIZE, FILE_HEADER_MAGIC, FILE_HEADER_SIZE
 
 tests/
   engine.rs       - integration tests (CRUD, persistence, compaction, concurrency)
