@@ -29,7 +29,13 @@ Engine
 
 ### On-disk format
 
-Each record is written as:
+The file starts with a fixed header:
+
+```
+[4 bytes: magic "KVS1"][8 bytes: compaction threshold as u64 LE]
+```
+
+Then each record is written as:
 
 ```
 [8 bytes: entry length as u64 LE][N bytes: wincode-serialized DataFileEntry]
@@ -42,13 +48,12 @@ Each record is written as:
 | Operation | Description |
 |---|---|
 | `load(path)` | Open an existing log and rebuild the index, or create a new file |
-| `load_with_threshold(path, bytes)` | Same as load but with a custom compaction threshold |
 | `set(key, value)` | Append a new entry and update the index |
 | `get(key)` | Look up the index and read the value from disk |
 | `del(key)` | Append a tombstone and remove the key from the index |
 | `compact()` | Rewrite the log keeping only live entries, shrink the file |
 
-Auto-compaction fires inside `set` whenever the log file exceeds the threshold (default 1 MB).
+Auto-compaction fires inside `set` whenever the log file exceeds the threshold (default 1 MB). After compaction, if the file size did not shrink, the threshold is doubled and persisted back to the file header.
 
 ## Concurrency
 
